@@ -5,8 +5,9 @@ import matplotlib.gridspec as gridspec
 import matplotlib.patches as patches
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import matplotlib.colors
+from aind_ephys_utils import align, sort
 
-import analysis_funcs as af
+#import analysis_funcs as af
 
 def shiftedColorMap(cmap, min_val, max_val, name):
     '''Function to offset the "center" of a colormap. Useful for data with a negative min and positive max and you want the middle of the colormap's dynamic range to be at zero. Adapted from https://stackoverflow.com/questions/7404116/defining-the-midpoint-of-a-colormap-in-matplotlib
@@ -116,9 +117,11 @@ def multi_unit_raster_plot(unit_ids, sorting_output, timestamps, waveform_extrac
     height = np.ceil(len(unit_ids)/width)
 
     plt.clf()
-    gs = gridspec.GridSpec(int(height), int(width), hspace=0.7)
-    #gs.update(top=1-(height*0.01), bottom=0+(height*0.02), left=0+(width*0.015), right=1-(width*0.015), wspace=0.5, hspace=0.7)
-    gs.update(wspace=0.5, hspace=0.7)
+    fig = plt.figure(figsize=((width * (len(trial_types)+1) * 3, height * 2)), constrained_layout=True)
+
+    gs = gridspec.GridSpec(int(height), int(width), hspace=0.9, wspace=0.4, figure=fig)
+    #gs.update(top=1-(height*0.01), bottom=0+(height*0.02), left=0+(width*0.015), right=1-(width*0.015), wspace=0.4, hspace=0.9)
+    #gs.update(wspace=0.4, hspace=0.9)
 
 
     for ind_unit, unit in enumerate(unit_ids):
@@ -130,7 +133,7 @@ def multi_unit_raster_plot(unit_ids, sorting_output, timestamps, waveform_extrac
         unit_waveform = template_ext.get_unit_template(unit)
         #unit_metrics = laser_response_metrics.query('unit_id == @unit')
         
-        gs_this_unit = gridspec.GridSpecFromSubplotSpec(2, len(trial_types)+1, subplot_spec=gs[int(ind_unit//width), int(ind_unit%width)], wspace=0.9, hspace=0.6, height_ratios=[0.005,1])
+        gs_this_unit = gridspec.GridSpecFromSubplotSpec(2, len(trial_types)+1, subplot_spec=gs[int(ind_unit//width), int(ind_unit%width)], wspace=0.8, hspace=0.6, height_ratios=[0.005,1])
         #gs_this_cool_unit = gridspec.GridSpecFromSubplotSpec(2, len(width_ratios), subplot_spec=gs_cool_units[ind_unit//num_cols, np.mod(ind_unit, num_cols)], wspace=0.2, hspace=0.5, height_ratios=[0.005,1])
 
         for ind_type, trial_type in enumerate(trial_types):
@@ -160,8 +163,14 @@ def multi_unit_raster_plot(unit_ids, sorting_output, timestamps, waveform_extrac
             # plot responses to train of pulses
             ax_raster = plt.subplot(gs_this_unit[1 + ind_type//2, ind_type%2])
             this_event_timestamps = laser_onset_times[tag_trials.index.tolist()]
-            event_locked_timestamps = af.event_locked_timestamps(unit_spike_times, this_event_timestamps, raster_time_range)
-            raster_plot(event_locked_timestamps, raster_time_range, y_axis, ms=2.5, markeredgecolor='none')
+            #event_locked_timestamps = af.event_locked_timestamps(unit_spike_times, this_event_timestamps, raster_time_range)
+            event_locked_timestamps, event_inds, unit_ids = align.to_events(unit_spike_times, this_event_timestamps, raster_time_range)
+            # convert to the ragged array raster_plot needs
+            ragged_array = []
+            for indtrial in range(len(this_event_timestamps)):
+                spikes_this_trial = event_locked_timestamps[event_inds==indtrial]
+                ragged_array.append(spikes_this_trial)
+            raster_plot(ragged_array, raster_time_range, y_axis, ms=2.5, markeredgecolor='none')
             #plt.xlabel(x_label)
             plt.ylabel(y_label)
             plt.xlim(raster_time_range)
@@ -214,9 +223,10 @@ def multi_unit_raster_plot(unit_ids, sorting_output, timestamps, waveform_extrac
         ax_title.axis('off')
         ax_title.set_title(f'cluster {unit}', fontweight='heavy')
 
-    height_scale = len(y_ticks)/4
-    plt.gcf().set_size_inches((width * (len(trial_types)+1) * 3, height * height_scale))
+    #gs.constrained_layout(plt.gcf())
+    #height_scale = len(y_ticks)/4
+    #plt.gcf().set_size_inches((width * (len(trial_types)+1) * 3, height * height_scale), constrained_layout=True)
     fig_format = 'png'
     fig_name = f'{fig_title}.{fig_format}'
-    plt.savefig(f'/results/{fig_name}', format=fig_format)
+    fig.savefig(f'/results/{fig_name}', format=fig_format)
     print(f'{fig_name} saved')

@@ -2,6 +2,7 @@ import spikeinterface.full as si
 import spikeinterface.extractors as se
 import spikeinterface.preprocessing as spre
 import spikeinterface.widgets as sw
+from spikeinterface.qualitymetrics.misc_metrics import isi_violations
 
 import os
 import re
@@ -13,6 +14,7 @@ import json
 import glob
 from tqdm import tqdm
 from xml.dom import minidom
+from itertools import product
 
 from aind_ephys_utils import align, sort
 from open_ephys.analysis import Session
@@ -30,6 +32,7 @@ class OptotaggingAnalysis:
     Parameters:
     recording_clipped_folder: The raw ephys recording folder
     recording_sorted_folder: The spike-sorted ephys folder, derived from raw ephys folder if none.
+    trials_csv: path to table of parameters used during each trial, if None assumed where Anna stores them
     opto_recording: Optional. Index of recording with laser presentations, default 0 
 
     Output:
@@ -37,7 +40,7 @@ class OptotaggingAnalysis:
     raster plots of putative tagged units
     '''
 
-    def __init__(self, recording_clipped_folder, recording_sorted_folder=None, trials_csv=None, opto_recording=0, laser_event_id='2'):
+    def __init__(self, recording_clipped_folder, recording_sorted_folder=None, trials_csv=None, opto_recording=0, laser_event_id='2', flip_NIDAQ=False):
         self.opto_recording = opto_recording
         self.recording_clipped_folder = recording_clipped_folder
         self.session = re.search('\d{6}_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}', recording_clipped_folder).group(0)
@@ -48,15 +51,53 @@ class OptotaggingAnalysis:
         if trials_csv is None:
             trials_csv = glob.glob(f"{recording_clipped_folder}/*opto.csv")[0]
         self.trial_ids = pd.read_csv(trials_csv, index_col=0)
-        self._get_laser_onset_times(laser_event_id)
+        self._get_laser_onset_times(laser_event_id, flip_NIDAQ)
 
-    
-
-    def _get_laser_onset_times(self, event_id):
+    def _get_laser_onset_times(self, event_id, flip_NIDAQ):
         event = se.read_openephys_event(self.recording_clipped_folder, block_index=0)
         events = event.get_events(channel_id="PXIe-6341Digital Input Line", segment_index=self.opto_recording)
         laser_pulses = events[events["label"] == event_id]
-        self.laser_onset_times = laser_pulses['time']
+        # is this always off by half a second if the sync event in NIDAQ was flipped??
+        if flip_NIDAQ:
+            adjustment = 0.5
+        else:
+            adjustment = 0
+        self.laser_onset_times = laser_pulses['time'] - adjustment
+
+    def _construct_one_query(self, param_names, param_values):
+        if len(param_names) != len(param_values):
+            raise Exception("Param names and values must have the same length.")
+        query = ""
+        for ind_param, param_name in enumerate(param_names):
+            this_value = param_values[ind_param]
+            if type(this_value) == str:
+                this_value = f"'{this_value}'"
+            if ind_param == 0:
+                this_chunk = f"{param_name} == {this_value}"
+            else:
+                this_chunk = f" and {param_name} == {this_value}"
+            query = query + this_chunk
+        return query
+
+    def _construct_one_column_name(self, param_values, suffix=None):
+        col_name = ""
+        for ind_param, this_value in enumerate(param_values):
+            if ind_param == 0:
+                this_chunk = f"{this_value}"
+            else:
+                this_chunk = f"_{this_value}"
+            if suffix is not None:
+                if suffix[ind_param] is not None:
+                    this_chunk = this_chunk + suffix[ind_param]
+            col_name = col_name + this_chunk
+        return col_name
+
+    def _calculate_all_trial_laser_onsets(self, duration, interval, num_pulses):
+        base_pulse = np.array([0, duration])
+        laser_times = []
+        for ind_pulse in range(num_pulses):
+            laser_times.append(base_pulse+(ind_pulse*(duration+interval)))
+        return laser_times
     
     def get_stream_names(self):
         settings_file = glob.glob(f"{self.recording_clipped_folder}/Record Node ???/settings.xml")[0]
@@ -67,7 +108,227 @@ class OptotaggingAnalysis:
         ap_streams = [stream.getAttribute('name') for stream in streams if stream.getAttribute('sample_rate')=='30000.0']
         return ap_streams
 
-    def one_probe_laser_responses(self, probe, timestamps, sorting_outputs, waveform_extractors, extremum_channels):
+    def np_opto_find_best_site(self, tag_trials):
+        duration = np.unique(tag_trials.duration)[0]
+        num_pulses = np.unique(tag_trials.num_pulses)[0]
+        pulse_interval = np.unique(tag_trials.pulse_interval)[0]
+        total_duration = (duration*num_pulses)+(pulse_interval*num_pulses)
+
+        this_sites = list(np.unique(tag_trials.site))
+
+        laser_total_time_range = [0, (total_duration+pulse_interval)/1000]
+        min_interval = np.min(tag_trials['interval'])
+        baseline_time_range = [-min_interval, 0]
+        unneeded_bins, baseline_spike_counts, unneeded_ids = align.to_events(unit_spike_times, all_tag_trials_timestamps, baseline_time_range, bin_size=np.diff(baseline_time_range)[0])
+        baseline_spike_rate = np.mean(baseline_spike_counts)/(baseline_time_range[-1]-baseline_time_range[0])
+
+        # for latency calculations later, using longer baseline to get better estimate of mean + stdev
+        baseline_rate_stdev = np.std(baseline_spike_counts/(baseline_time_range[-1]-baseline_time_range[0]))
+        threshold_spike_rate = baseline_spike_rate + 2*baseline_rate_stdev
+        # time_range_raster = [-(duration * 2) / 1000, (duration + pulse_interval) / 1000]
+
+        # smoothing params for psth for estimating max response
+        win = np.concatenate((np.zeros(3), np.ones(3)))  # square (causal)
+        win = win/np.sum(win)
+        bin_size = 1 # in ms
+        bin_edges_full = np.arange(laser_total_time_range[0],laser_total_time_range[-1], bin_size/1000)
+        
+        all_responses = np.zeros(len(this_sites))
+        # all_responses_o = np.zeros(len(this_sites))
+
+        for ind_site, site in enumerate(this_sites):
+            this_tag_trials = tag_trials.query('site == @site')
+            this_tag_laser_event_timestamps = self.laser_onset_times[this_tag_trials.index.tolist()]
+
+            # create smoothed PSTH of response to entire train
+            unneeded_bins, laser_spike_counts, unneeded_ids = align.to_events(unit_spike_times, this_tag_laser_event_timestamps, laser_total_time_range, bin_size=bin_size/1000)
+
+            average_response = np.mean(laser_spike_counts,axis=1)/(bin_size/1000)
+            smooth_PSTH = np.convolve(average_response, win, mode='same')
+            normalised_PSTH = smooth_PSTH - baseline_spike_rate
+            # only looking for greatest increase in firing rate to indicate tagging
+            max_response = np.max(normalised_PSTH)
+
+            all_responses[ind_site] = max_response
+
+    def calculate_laser_response_latency(self, unit_spike_times, this_trials_timestamps, laser_start_times, full_time_range, bin_size=0.001, sigma=2, smooth_win_size=3, ignore_onset=False):
+        num_pulses = len(laser_start_times)
+        all_latencies = np.zeros(num_pulses)
+        all_jitter = np.zeros(num_pulses)
+
+        # smoothing window
+        win = np.concatenate((np.zeros(smooth_win_size), np.ones(smooth_win_size)))  # square (causal)
+        win = win/np.sum(win)
+
+        # calculate the baseline spike rate and stdev
+        baseline_time_range = [full_time_range[0], laser_start_times[0]]
+        unneeded_bins, baseline_spike_counts, unneeded_ids = align.to_events(unit_spike_times, this_trials_timestamps, baseline_time_range, bin_size=np.diff(baseline_time_range)[0])
+        baseline_spike_rate = np.mean(baseline_spike_counts)/(baseline_time_range[-1]-baseline_time_range[0])
+        baseline_rate_stdev = np.std(baseline_spike_counts/(baseline_time_range[-1]-baseline_time_range[0]))
+
+        # threshold for responsiveness
+        threshold_spike_rate = baseline_spike_rate + sigma*baseline_rate_stdev
+        
+        for ind_pulse, laser_timestamp in enumerate(laser_start_times):
+            if ind_pulse == len(laser_start_times)-1:
+                this_latency_time_range = [laser_start_times[ind_pulse], full_time_range[-1]]
+            else:
+                this_latency_time_range = [laser_start_times[ind_pulse], laser_start_times[ind_pulse+1]]
+            # ignore first bin if concerned about laser onset artifacts
+            if ignore_onset:
+                this_latency_time_range[0] = this_latency_time_range[0] + bin_size
+            this_pulse_latency_locked_timestamps, latency_event_ids, unneeded_ids = align.to_events(unit_spike_times, this_trials_timestamps, this_latency_time_range)
+            this_bin_edges, this_pulse_latency_spike_counts, unneeded_ids = align.to_events(unit_spike_times, this_trials_timestamps, this_latency_time_range, bin_size=bin_size)
+            average_response = np.mean(this_pulse_latency_spike_counts,axis=1)/bin_size
+            smooth_PSTH = np.convolve(average_response, win, mode='same')
+            responsive_inds = np.flatnonzero(smooth_PSTH>threshold_spike_rate)
+            if len(responsive_inds)>0:
+                first_responsive_ind = responsive_inds[0]
+                y_diff = (smooth_PSTH[first_responsive_ind]-smooth_PSTH[first_responsive_ind-1])
+                y_fraction = (threshold_spike_rate-smooth_PSTH[first_responsive_ind-1])/ y_diff
+                response_latency = this_bin_edges[first_responsive_ind] + y_fraction*bin_size - this_latency_time_range[0]
+                if ignore_onset:
+                    response_latency = response_latency + bin_size
+            else:
+                response_latency = None
+            all_latencies[ind_pulse] = response_latency
+
+            # jitter
+            if response_latency is not None and len(this_pulse_latency_locked_timestamps) > 0:
+                pulse_timestamps_filtered = []
+                for ind in np.unique(latency_event_ids):
+                    this_pulse_first_spike_ind = np.where(latency_event_ids == ind)[0][0]
+                    pulse_timestamps_filtered.append(this_pulse_latency_locked_timestamps[this_pulse_first_spike_ind])
+                # pulse_timestamps_filtered = [timestamps[0] for timestamps in this_pulse_latency_locked_timestamps if len(timestamps)>0]
+                if len(pulse_timestamps_filtered) > 1:
+                    jitter = np.std(pulse_timestamps_filtered)
+                else:
+                    jitter = None
+            else:
+                jitter = None
+            all_jitter[ind_pulse] = jitter
+
+        return all_latencies, all_jitter
+
+    def calculate_pulse_train_responses(self, unit_spike_times, this_trials_timestamps, laser_time_ranges, baseline_time_range):
+        # calculate pvals and reliability for all pulses
+        num_pulses = len(laser_time_ranges)
+        all_pvals = np.ones(num_pulses)
+        all_reliability = np.zeros(num_pulses)
+
+        # baseline counts for comparison
+        unneeded_bins, baseline_spike_counts, unneeded_ids = align.to_events(unit_spike_times, this_trials_timestamps, baseline_time_range, bin_size=np.diff(baseline_time_range)[0])
+
+        for ind_pulse, this_laser_time_range in enumerate(laser_time_ranges):
+            unneeded_bins, this_pulse_spike_counts, unneeded_ids = align.to_events(unit_spike_times, this_trials_timestamps, this_laser_time_range, bin_size=np.diff(this_laser_time_range)[0])
+            #all_pulse_spike_counts.append(this_pulse_spike_counts.flatten())
+
+            # paired test (since comparing baseline to laser for each trial)
+            try:
+                statistic, pVal = stats.wilcoxon(this_pulse_spike_counts.flatten()/np.diff(this_laser_time_range),
+                                        baseline_spike_counts.flatten()/np.diff(baseline_time_range),
+                                        alternative='greater')
+            except(ValueError):  # wilcoxon test doesn't like it when there's no difference between passed values
+                statistic = 0
+                pVal = 1
+            all_pvals[ind_pulse] = pVal
+
+            # reliability
+            all_reliability[ind_pulse] = np.count_nonzero(this_pulse_spike_counts)/len(this_pulse_spike_counts)
+
+        # corrected pvals
+        (responsive_sites_paired, corrected_pVals_paired, alphaSidak, alphaBonf) = multipletests(all_pvals, method='holm')
+        return responsive_sites_paired, corrected_pVals_paired, all_reliability
+
+    def one_probe_laser_responses(self, timestamps, sorting_outputs, waveform_extractors, extremum_channels, trials_query, stream_name, 
+                                  suffixes=None, npopto_sites=None, ignore_onset_offset=True, params_in_ms=True, pulse_len_param='duration', 
+                                  pulse_interval_param='pulse_interval', num_pulses_param='num_pulses', iti_param='interval', pre_opto_duration=None):
+        print(f'Now processing session {self.session}, {stream_name}')
+        all_laser_response_metrics = []
+        for ind_sorting, sorting_output in enumerate(sorting_outputs):
+            print(f'Channel group {ind_sorting}')
+
+            # create dataframe for this probe/shank
+            this_laser_response_metrics = pd.DataFrame({'unit_id':sorting_output.unit_ids.flatten()})
+
+            # iterate through every unit, calculate response metrics based off the trials_query passed
+            for ind_unit, unit in enumerate(tqdm(sorting_output.unit_ids)):
+                sample_numbers = sorting_output.get_unit_spike_train(unit, segment_index=self.opto_recording)
+                unit_spike_times = timestamps[sample_numbers]
+
+                # save best channel
+                peak_channel = int(extremum_channels[ind_sorting][unit][2:])
+                this_laser_response_metrics.at[ind_unit, 'peak_channel'] = peak_channel
+
+                # calculate quality metrics for pre-stim period
+                if pre_opto_duration is not None:
+                    stimulus_start = self.laser_onset_times[0] - 1
+                    spontaneous_start = stimulus_start - pre_opto_duration
+
+                    spont_inds = np.searchsorted(unit_spike_times, [spontaneous_start, stimulus_start])
+                    spont_spike_times = unit_spike_times[spont_inds[0]:spont_inds[1]]
+                    isi_ratio, isi_rate, isi_count = isi_violations([spont_spike_times], pre_opto_duration)
+
+                    this_laser_response_metrics.at[ind_unit, 'pre_stim_isi_ratio'] = isi_ratio
+                    this_laser_response_metrics.at[ind_unit, 'pre_stim_spike_rate'] = len(spont_spike_times)/pre_opto_duration
+
+                # get combination of all parameters to query for laser responses, iterate
+                params_combos = list(product(*tuple(trials_query.values())))
+                for this_params in params_combos:
+                    this_query = self._construct_one_query(list(trials_query.keys()), this_params)
+
+                    # this is kinda specific to Anna's trial table... need to make this more general?
+                    if "emission_location" in self.trial_ids.columns:
+                        this_query = this_query + f" and emission_location == '{stream_name}'"
+
+                    # if NPopto, add sites to query, find best site for each combo of parameters
+                    # get laser responses for all combinations of parameters and best npopto site (if npopto)
+
+
+                    # query trials table for trials with these parameters
+                    this_trials = self.trial_ids.query(this_query)
+                    this_trials_timestamps = self.laser_onset_times[this_trials.index.tolist()]
+
+                    # get laser on times for this param group
+                    # assuming there are parameters in the trials csv for 1) pulse length 2) pulse interval 3) num pulses
+                    # can add something here in the future if other people save this data differently? e.g. reporting frequency
+                    if params_in_ms:
+                        adjustment = 1000
+                    else:
+                        adjustment = 1
+                    duration = np.unique(this_trials[pulse_len_param])[0]/adjustment
+                    num_pulses = np.unique(this_trials[num_pulses_param])[0]
+                    pulse_interval = np.unique(this_trials[pulse_interval_param])[0]/adjustment
+                    total_duration = (duration*num_pulses)+(pulse_interval*num_pulses)
+
+                    laser_time_ranges = self._calculate_all_trial_laser_onsets(duration, pulse_interval, num_pulses)
+                    baseline_time_range = [-duration, 0]
+
+                    # use half of ITI as baseline for latency
+                    median_ITI = np.median(this_trials[iti_param])
+                    laser_start_times = [times[0] for times in laser_time_ranges]
+                    full_time_range = [-median_ITI/2, total_duration]
+                    all_latencies, all_jitter = self.calculate_laser_response_latency(unit_spike_times, this_trials_timestamps, laser_start_times, full_time_range, ignore_onset=ignore_onset_offset)
+
+                    if ignore_onset_offset:
+                        laser_times_adjusted = [[x+0.001, y-0.001] for [x,y] in laser_time_ranges]
+                        baseline_time_range_adjusted = [baseline_time_range[0]+0.001, baseline_time_range[-1]-0.001]
+                    else:
+                        laser_times_adjusted = laser_time_ranges
+                        baseline_time_range_adjusted = baseline_time_range
+                    responsive_sites_paired, corrected_pVals_paired, all_reliability = self.calculate_pulse_train_responses(unit_spike_times, this_trials_timestamps, laser_times_adjusted, baseline_time_range_adjusted)
+
+                    # add these metrics to the laser response csv
+                    this_params_prefix = self._construct_one_column_name(this_params, suffixes)
+                    this_laser_response_metrics.at[ind_unit, f'{this_params_prefix}_mean_latency'] = np.mean(all_latencies)
+                    this_laser_response_metrics.at[ind_unit, f'{this_params_prefix}_mean_jitter'] = np.mean(all_jitter)
+                    this_laser_response_metrics.at[ind_unit, f'{this_params_prefix}_mean_reliability'] = np.mean(all_reliability)
+                    this_laser_response_metrics.at[ind_unit, f'{this_params_prefix}_num_sig_pulses'] = np.sum(responsive_sites_paired)
+            all_laser_response_metrics.append(this_laser_response_metrics)
+        return all_laser_response_metrics
+
+
+    def one_probe_laser_responses_old(self, probe, timestamps, sorting_outputs, waveform_extractors, extremum_channels):
         print(f'Now processing session {self.session}, {probe}')
         all_laser_response_metrics = []
         param_group = 'train'
