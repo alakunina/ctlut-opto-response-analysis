@@ -230,3 +230,73 @@ def multi_unit_raster_plot(unit_ids, sorting_output, timestamps, waveform_extrac
     fig_name = f'{fig_title}.{fig_format}'
     fig.savefig(f'/results/{fig_name}', format=fig_format)
     print(f'{fig_name} saved')
+
+def pulse_plot(unit_spike_times, trial_laser_onset_times, time_range, duration, inter_pulse_interval, num_pulses, latency, title=None, color='tomato'):
+    for pulse in range(num_pulses):
+        this_time_range = time_range + (pulse * inter_pulse_interval)
+        this_pulse_latency_locked_timestamps, latency_event_ids, unneeded_ids = align.to_events(unit_spike_times, trial_laser_onset_times, this_time_range)
+        plt.plot(this_pulse_latency_locked_timestamps - (pulse * inter_pulse_interval), latency_event_ids + (len(trial_laser_onset_times)*pulse), 'k.', ms=2)
+        plt.axhline(len(trial_laser_onset_times)*pulse, color='0.75')
+    plt.axvline(latency, color='blue', ls='--')
+    plt.axvspan(0, duration, color=color, alpha=0.3)
+    plt.xlim(time_range)
+    plt.ylim(0, len(trial_laser_onset_times)*num_pulses)
+    plt.yticks(range(int(len(trial_laser_onset_times)/2), int(len(trial_laser_onset_times)*(num_pulses+1)-(len(trial_laser_onset_times)/2)), int(len(trial_laser_onset_times))))
+    plt.gca().set_yticklabels(range(1,num_pulses+1))
+    #plt.ylabel('Pulse')
+    #plt.xlabel('Time from laser onset (s)')
+    if title is not None:
+        plt.title(title)
+
+def multi_unit_pulse_plot(unit_ids, sorting_output, timestamps, laser_response_metrics, laser_onset_times, trial_ids, trial_types, probe_name, fig_title):
+    width = np.ceil(np.sqrt(len(unit_ids)))
+    height = np.ceil(len(unit_ids)/width)
+
+    plt.clf()
+    fig = plt.figure(figsize=((width*4, height*3)), constrained_layout=True)
+
+    gs = fig.add_gridspec(int(height), int(width), hspace=0.9, wspace=0.4, figure=fig)
+    
+    for ind_unit, unit_id in enumerate(unit_ids):
+        sample_numbers = sorting_output.get_unit_spike_train(unit_id, segment_index=0)
+        unit_spike_times = timestamps[sample_numbers]
+        unit_metrics = laser_response_metrics.loc[laser_response_metrics['unit_id'] == unit_id]
+
+        #gs_this_unit = gridspec.GridSpecFromSubplotSpec(2, len(trial_types), subplot_spec=gs[int(ind_unit//width), int(ind_unit%width)], wspace=0.7, hspace=0.6, height_ratios=[0.005,1])
+        gs_this_unit = gs[int(ind_unit//width), int(ind_unit%width)].subgridspec(2, len(trial_types), wspace=0.6, hspace=0.6, height_ratios=[0.005,1])
+        for ind_type, trial_type in enumerate(trial_types):
+            best_power = float(unit_metrics[f'{trial_type}_train_best_power'])
+            if np.isnan(best_power):
+                best_power = float(max(np.unique(trial_ids['power'])))
+            latency = float(unit_metrics[f'{trial_type}_train_best_mean_latency'])
+            tag_trials = trial_ids.query(f'param_group == "train" and site == 0 and type == @trial_type and emission_location == @probe_name and power == @best_power')
+            trial_laser_onset_times = laser_onset_times[tag_trials.index.tolist()]
+
+            duration = np.unique(tag_trials.duration)[0]
+            num_pulses = np.unique(tag_trials.num_pulses)[0]
+            pulse_interval = np.unique(tag_trials.pulse_interval)[0]
+            time_range = [-(duration/2)/1000, (duration*1.5)/1000]
+
+            ax_raster = fig.add_subplot(gs_this_unit[1, ind_type])
+            pulse_plot(unit_spike_times, trial_laser_onset_times, time_range, duration/1000, (duration + pulse_interval)/1000, num_pulses, latency, title=f'{best_power} mW', color='tomato' if 'red' in trial_type else 'skyblue')
+            if ind_type == 0:
+                plt.ylabel("Pulse")
+        
+        # group axes
+        ax_group = fig.add_subplot(gs_this_unit[1,:])
+        ax_group.set_xticks([])
+        ax_group.set_yticks([])
+        ax_group.set_frame_on(False)
+        ax_group.set_xlabel("Time from laser onset (s)", labelpad=20)
+
+        # Add ghost axes so I can add a title with cluster number...
+        ax_title = plt.subplot(gs_this_unit[0, :])
+        ax_title.axis('off')
+        ax_title.set_title(f'cluster {unit_id}', fontweight='heavy')
+
+    fig_format = 'png'
+    fig_name = f'{fig_title}.{fig_format}'
+    fig.savefig(f'/results/{fig_name}', format=fig_format)
+    print(f'{fig_name} saved')
+
+        

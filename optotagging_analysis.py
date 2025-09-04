@@ -154,6 +154,7 @@ class OptotaggingAnalysis:
     def calculate_laser_response_latency(self, unit_spike_times, this_trials_timestamps, laser_start_times, full_time_range, bin_size=0.001, sigma=2, smooth_win_size=3, ignore_onset=False):
         num_pulses = len(laser_start_times)
         all_latencies = np.zeros(num_pulses)
+        all_latencies_median = np.zeros(num_pulses)
         all_jitter = np.zeros(num_pulses)
 
         # smoothing window
@@ -193,22 +194,26 @@ class OptotaggingAnalysis:
                 response_latency = None
             all_latencies[ind_pulse] = response_latency
 
-            # jitter
-            if response_latency is not None and len(this_pulse_latency_locked_timestamps) > 0:
+            # median time to first spike and jitter
+            if len(this_pulse_latency_locked_timestamps) > 0:
                 pulse_timestamps_filtered = []
                 for ind in np.unique(latency_event_ids):
                     this_pulse_first_spike_ind = np.where(latency_event_ids == ind)[0][0]
                     pulse_timestamps_filtered.append(this_pulse_latency_locked_timestamps[this_pulse_first_spike_ind])
                 # pulse_timestamps_filtered = [timestamps[0] for timestamps in this_pulse_latency_locked_timestamps if len(timestamps)>0]
                 if len(pulse_timestamps_filtered) > 1:
+                    median_latency = np.median(pulse_timestamps_filtered)
                     jitter = np.std(pulse_timestamps_filtered)
                 else:
                     jitter = None
+                    median_latency = None
             else:
                 jitter = None
+                median_latency = None
             all_jitter[ind_pulse] = jitter
+            all_latencies_median[ind_pulse] = median_latency
 
-        return all_latencies, all_jitter
+        return all_latencies, all_latencies_median, all_jitter
 
     def calculate_pulse_train_responses(self, unit_spike_times, this_trials_timestamps, laser_time_ranges, baseline_time_range):
         # calculate pvals and reliability for all pulses
@@ -240,13 +245,15 @@ class OptotaggingAnalysis:
         (responsive_sites_paired, corrected_pVals_paired, alphaSidak, alphaBonf) = multipletests(all_pvals, method='holm')
         return responsive_sites_paired, corrected_pVals_paired, all_reliability
 
-    def one_probe_laser_responses(self, timestamps, sorting_outputs, waveform_extractors, extremum_channels, trials_query, stream_name, 
-                                  suffixes=None, npopto_sites=None, ignore_onset_offset=True, params_in_ms=True, pulse_len_param='duration', 
-                                  pulse_interval_param='pulse_interval', num_pulses_param='num_pulses', iti_param='interval', pre_opto_duration=None):
+    def one_probe_laser_responses(self, timestamps, sorting_data, trials_query, stream_name, suffixes=None, npopto_sites=None, 
+                                  ignore_onset_offset=True, params_in_ms=True, pulse_len_param='duration', pulse_interval_param='pulse_interval', 
+                                  num_pulses_param='num_pulses', iti_param='interval', pre_opto_duration=None):
         print(f'Now processing session {self.session}, {stream_name}')
-        all_laser_response_metrics = []
-        for ind_sorting, sorting_output in enumerate(sorting_outputs):
-            print(f'Channel group {ind_sorting}')
+        all_laser_response_metrics = {}
+        for sorting_group in list(sorting_data.keys()):
+            print(f'Channel group {sorting_group}')
+            sorting_output = sorting_data[sorting_group]['sorting_output']
+            extremum_channels = sorting_data[sorting_group]['extremum_channels']
 
             # create dataframe for this probe/shank
             this_laser_response_metrics = pd.DataFrame({'unit_id':sorting_output.unit_ids.flatten()})
@@ -257,7 +264,7 @@ class OptotaggingAnalysis:
                 unit_spike_times = timestamps[sample_numbers]
 
                 # save best channel
-                peak_channel = int(extremum_channels[ind_sorting][unit][2:])
+                peak_channel = int(extremum_channels[unit][2:])
                 this_laser_response_metrics.at[ind_unit, 'peak_channel'] = peak_channel
 
                 # calculate quality metrics for pre-stim period
@@ -308,7 +315,7 @@ class OptotaggingAnalysis:
                     median_ITI = np.median(this_trials[iti_param])
                     laser_start_times = [times[0] for times in laser_time_ranges]
                     full_time_range = [-median_ITI/2, total_duration]
-                    all_latencies, all_jitter = self.calculate_laser_response_latency(unit_spike_times, this_trials_timestamps, laser_start_times, full_time_range, ignore_onset=ignore_onset_offset)
+                    all_latencies, all_latencies_median, all_jitter = self.calculate_laser_response_latency(unit_spike_times, this_trials_timestamps, laser_start_times, full_time_range, ignore_onset=ignore_onset_offset)
 
                     if ignore_onset_offset:
                         laser_times_adjusted = [[x+0.001, y-0.001] for [x,y] in laser_time_ranges]
@@ -321,10 +328,12 @@ class OptotaggingAnalysis:
                     # add these metrics to the laser response csv
                     this_params_prefix = self._construct_one_column_name(this_params, suffixes)
                     this_laser_response_metrics.at[ind_unit, f'{this_params_prefix}_mean_latency'] = np.mean(all_latencies)
+                    this_laser_response_metrics.at[ind_unit, f'{this_params_prefix}_latency_range'] = np.max(all_latencies) - np.min(all_latencies)
+                    this_laser_response_metrics.at[ind_unit, f'{this_params_prefix}_mean_time_to_first_spike'] = np.mean(all_latencies_median)
                     this_laser_response_metrics.at[ind_unit, f'{this_params_prefix}_mean_jitter'] = np.mean(all_jitter)
                     this_laser_response_metrics.at[ind_unit, f'{this_params_prefix}_mean_reliability'] = np.mean(all_reliability)
                     this_laser_response_metrics.at[ind_unit, f'{this_params_prefix}_num_sig_pulses'] = np.sum(responsive_sites_paired)
-            all_laser_response_metrics.append(this_laser_response_metrics)
+            all_laser_response_metrics[sorting_group] = this_laser_response_metrics
         return all_laser_response_metrics
 
 
@@ -333,7 +342,6 @@ class OptotaggingAnalysis:
         all_laser_response_metrics = []
         param_group = 'train'
         trial_types = np.unique(self.trial_ids.type)
-        #timestamps, sorting_outputs, waveform_extractors, extremum_channels = self._get_sorting_output(probe)
 
         if probe[-3:] == '-AP':
             this_probe = probe[:-3]
@@ -613,8 +621,6 @@ class OptotaggingAnalysis:
 
         return queries
 
-
-
     def get_sorting_output(self, probe):
         sorting_folder = glob.glob(f"{self.recording_sorted_folder}/*curated/experiment1_Record Node ???#Neuropix-PXI-???.{probe}_recording{self.opto_recording+1}")
         waveform_folder = glob.glob(f"{self.recording_sorted_folder}/postprocessed/experiment1_Record Node ???#Neuropix-PXI-???.{probe}_recording{self.opto_recording+1}*")
@@ -630,16 +636,23 @@ class OptotaggingAnalysis:
         sorting_folder.sort()
         waveform_folder.sort()
 
-        sorting_outputs = []
-        waveform_extractors = []
-        extremum_channels = []
+        sorted_data = {}
 
         for ind_sorting, sorting in enumerate(sorting_folder):
+            if "group" in sorting:
+                this_key = sorting[sorting.find("group"):]
+            else:
+                this_key = 'group0'
+
             this_sorting_output = si.load_extractor(sorting)
             this_waveform_extractor = si.load_sorting_analyzer_or_waveforms(waveform_folder[ind_sorting], sorting=this_sorting_output)
 
-            sorting_outputs.append(this_sorting_output)
-            waveform_extractors.append(this_waveform_extractor)
-            extremum_channels.append(si.get_template_extremum_channel(this_waveform_extractor))
+            this_sorting_dict = {
+                'sorting_output' : this_sorting_output,
+                'waveform_extractor' : this_waveform_extractor,
+                'extremum_channels' : si.get_template_extremum_channel(this_waveform_extractor)
+            }
 
-        return timestamps, sorting_outputs, waveform_extractors, extremum_channels
+            sorted_data[this_key] = this_sorting_dict
+
+        return timestamps, sorted_data
